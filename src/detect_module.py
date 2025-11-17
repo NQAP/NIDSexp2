@@ -13,8 +13,10 @@ class ShallowFCN(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(input_features, hidden_1),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_1, hidden_2),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_2, num_classes)
         )
 
@@ -40,9 +42,9 @@ def detect_module(input_features: int, num_classes: int):
     
     # 為了使總參數接近論文中提到的 12,281
     # (假設 input_features=78, num_classes=9)
-    # (78 * 100 + 100) + (100 * 50 + 50) + (50 * 9 + 9) = 13,409 (接近)
-    HIDDEN_LAYER_1 = 100
-    HIDDEN_LAYER_2 = 50
+    # (58 * 100 + 100) + (100 * 50 + 50) + (50 * 9 + 9) = 13,409 (接近)
+    HIDDEN_LAYER_1 = 256
+    HIDDEN_LAYER_2 = 128
     
     if input_features <= 0:
         logging.warning(f"輸入特徵維度 ({input_features}) 不尋常。")

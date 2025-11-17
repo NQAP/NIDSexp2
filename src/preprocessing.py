@@ -10,6 +10,8 @@ from sklearn.model_selection import train_test_split
 
 # --- 導入欄位名稱對應表 ---
 from column_map import COLUMN_MAP
+from features_whitelist import FEATURES_WHITELIST
+from generation_module import generate_stacked_data
 
 def standardize_columns(df):
     """
@@ -81,8 +83,106 @@ def clean_features(df):
     if all_zero_columns:
         logging.info(f"移除 {len(all_zero_columns)} 個全為 0 的特徵: {all_zero_columns}")
         df = df.drop(columns=all_zero_columns)
+
+    feature_cols = [col for col in FEATURES_WHITELIST if col in df.columns]
+    
+    missing_in_csv = set(FEATURES_WHITELIST) - set(df.columns)
+    if missing_in_csv:
+        logging.warning(f"您的 CSV 檔案中缺少 TABLE V 的 {len(missing_in_csv)} 個特徵: {list(missing_in_csv)[:5]}...")
+        
+    logging.info(f"成功匹配 {len(feature_cols)} / 58 個來自 TABLE V 的特徵。")
+
+    if len(feature_cols) == 0:
+        logging.error("沒有找到任何 TABLE V 特徵欄位。請檢查 column_map.py 是否正確。")
+        return None, None, None, None, None, None, None
+
+    df = df[feature_cols]
         
     return df
+
+# (新) 定義重採樣的常數
+# 必須與 train_stacked_ctgan.py 中的 MAX_SAMPLES_PER_MODEL 一致
+TARGET_SAMPLES_PER_CLASS = 15000 
+# (*** 新增：定義多數類別的名稱 ***)
+MAJORITY_CLASS_NAME = "BENIGN" # 假設 'BENIGN' 已被轉為大寫
+
+
+def resample_with_hybrid_ctgan(X_train_df: pd.DataFrame, 
+                             y_train_series: pd.Series,
+                             artifacts_dir: str, 
+                             label_encoder,
+                             num_samples_per_label: int = 15000):
+    """
+    (*** 重構：混合採樣 (Hybrid Sampling) ***)
+    使用 Stacked-CTGAN 模型來平衡訓練資料集。
+    
+    - 對 MAJORITY_CLASS_NAME (例如 'BENIGN') 進行「欠採樣」(Undersample) 真實資料。
+    - 對所有「其他類別」(攻擊)，載入其 CTGAN 模型並進行「過採樣」(Oversample) 生成合成資料。
+    - 對生成的資料進行反向 Log 轉換 (expm1)。
+    - 返回一個平衡的、(真實+合成) 混合的資料集。
+    """
+    logging.info(f"--- 開始「混合採樣」 (目標: {num_samples_per_label} 筆 / 每個類別) ---")
+    
+    # 將 X 和 y 暫時合併，以便過濾
+    df_train = X_train_df.copy()
+    df_train['label'] = y_train_series
+    
+    resampled_dfs = [] # 用於收集所有平衡後的資料框
+    unique_labels = y_train_series.unique()
+
+    for label in unique_labels:
+        if label == MAJORITY_CLASS_NAME:
+            # --- 1. 多數類別：欠採樣 (Undersample) 真實資料 ---
+            logging.info(f"  處理多數類別 '{label}': 進行「欠採樣」...")
+            label_data = df_train[df_train['label'] == label]
+            
+            # 確保即使原始資料少於目標，也能正常運作
+            sample_size = min(len(label_data), num_samples_per_label)
+            resampled_data = label_data.sample(
+                n=sample_size, 
+                random_state=42
+            )
+            resampled_dfs.append(resampled_data)
+        
+        else:
+            # --- 2. 少數類別 (攻擊)：過採樣 (Oversample) 合成資料 ---
+            model_path = os.path.join(artifacts_dir, f"ctgan_{label}.pkl")
+            
+            if not os.path.exists(model_path):
+                logging.warning(f"  找不到 '{label}' 的 CTGAN 模型。將使用「原始資料」進行欠採樣...")
+                # 備案：如果 GAN 不存在，也對其進行欠採樣（或使用全部）
+                label_data = df_train[df_train['label'] == label]
+                sample_size = min(len(label_data), num_samples_per_label)
+                resampled_data = label_data.sample(n=sample_size, random_state=42)
+                resampled_dfs.append(resampled_data)
+                continue
+                
+            logging.info(f"  處理少數類別 '{label}': 進行「過採樣」(生成資料)...")
+            try:
+                label_data = df_train[df_train['label'] == label]
+                sample_size = max(0, num_samples_per_label - len(df_train[df_train['label'] == label])) 
+                synthetic_data = generate_stacked_data(artifacts_dir=artifacts_dir, label=label, num_samples_per_label=sample_size)
+                
+                synthetic_data['label'] = label 
+                resampled_dfs.append(synthetic_data)
+                resampled_dfs.append(label_data)
+                
+            except Exception as e:
+                logging.error(f"  生成 '{label}' 資料失敗: {e}. 跳過此類別。")
+
+    if not resampled_dfs:
+        logging.error("未生成或採樣任何資料。中止。")
+        return pd.DataFrame(), pd.Series()
+
+    # 將所有處理過的資料框合併
+    df_resampled = pd.concat(resampled_dfs, ignore_index=True)
+    
+    # 徹底隨機打亂最終的資料集
+    df_resampled = df_resampled.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    logging.info(f"「混合採樣」完成。總共 {len(df_resampled)} 筆資料。")
+    
+    return df_resampled
 
 def old_data_preprocessing(data_path: str, output_dir: str):
     """
@@ -118,44 +218,69 @@ def old_data_preprocessing(data_path: str, output_dir: str):
     # 3. 分離特徵和標籤
     if 'label' not in df.columns:
         logging.error("資料中找不到 'label' 欄位。請檢查 column_map.py。")
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
         
-    # 將標籤轉為大寫以保持一致
     logging.debug("將標籤轉換為大寫...")
     df['label'] = df['label'].astype(str).str.upper()
     
     y = df['label']
     X = df.drop(columns=['label'])
     
-    # 移除識別符號欄位 (不應作為特徵)
-    # 這些是我們在 column_map 中定義的非特徵欄位
-    id_cols = ['flow_id', 'src_ip', 'src_port', 'dst_ip', 'dst_port', 'timestamp', 'protocol']
-    feature_cols = [col for col in X.columns if col not in id_cols]
-    
-    if len(feature_cols) == 0:
-        logging.error("沒有找到任何特徵欄位。請檢查 column_map.py 是否正確。")
-        return None, None, None, None, None, None
-        
-    X = X[feature_cols]
+    # (*** 關鍵修正 ***)
+    # 我們的特徵集 = 白名單中存在於 X 的欄位
 
+    print (len(X.columns))
+    
     # 4. 分割資料 (7:3)
     logging.info("將 2017 資料分割為 70% 訓練集和 30% 測試集...")
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.3, random_state=42, stratify=y
     )
 
-    # 5. 擬合 (Fit) Scaler 和 Encoder
-    # --- 擬合 MinMaxScaler ---
+    # 5. (新) 擬合 LabelEncoder (必須在生成資料前)
+    #    (重要) 必須在「所有」可能的原始標籤上 fit，以捕獲所有類別
+    le = LabelEncoder()
+    logging.info("正在使用 2017 *原始* 標籤擬合 (fit) LabelEncoder...")
+    le.fit(pd.concat([y_train, y_test], ignore_index=True)) 
+
+
+    # 7. 擬合 (Fit) Scaler 和 Encoder
     scaler = MinMaxScaler()
-    logging.info("正在使用 2017 訓練資料擬合 (fit) MinMaxScaler...")
-    scaler.fit(X_train)
+    logging.info("正在使用 2017 (CTGAN 處理後) 訓練資料擬合 (fit) MinMaxScaler...")
+    scaler.fit(X_train) # (新) 在 resampled 資料上 fit
     
-    # --- 擬合 LabelEncoder ---
     le = LabelEncoder()
     logging.info("正在使用 2017 訓練標籤擬合 (fit) LabelEncoder...")
-    le.fit(y_train)
+    le.fit(y_train) # (不變) 仍然在「原始」y_train 上 fit，以學習真實標籤
 
-    # 6. 儲存 Artifacts
+    # 7. (*** 新 ***) 計算類別權重 (Class Weights)
+    logging.info("正在計算類別權重以處理不平衡問題...")
+    y_train_encoded = le.transform(y_train) # 轉換為數字
+    
+    class_counts_encoded = pd.Series(y_train_encoded).value_counts()
+    class_counts_df = pd.DataFrame({'counts': class_counts_encoded})
+    # .reindex 確保權重向量的索引 (0, 1, 2...) 與 le.classes_ 的順序一致
+    class_counts_sorted = class_counts_df.reindex(range(len(le.classes_))).fillna(1)['counts']
+    
+    total_samples = len(y_train_encoded)
+    num_classes = len(le.classes_)
+    
+    weights_series = total_samples / (num_classes * class_counts_sorted)
+    
+    # (*** 關鍵修正 ***)
+    # 裁切 (Clip) 權重，避免極端值。
+    weights_series = weights_series.clip(lower=1.0, upper=8.2)
+    logging.info("權重已被裁切 (Clip) 在 [1.0, 10.0] 範圍內。")
+
+    class_weights_tensor = torch.tensor(weights_series.values, dtype=torch.float32)
+    
+    try:
+        benign_index = le.transform(['BENIGN'])[0]
+        logging.info(f"類別權重計算完成。例如 'BENIGN' (索引 {benign_index}): {weights_series[benign_index]:.4f}")
+    except ValueError:
+        logging.warning("在 y_train 中找不到 'BENIGN' 標籤來顯示權重範例。")
+    
+    # 8. 儲存 Artifacts
     os.makedirs(output_dir, exist_ok=True)
     scaler_path = os.path.join(output_dir, "minmax_scaler_2017.joblib")
     le_path = os.path.join(output_dir, "label_encoder_2017.joblib")
@@ -165,24 +290,24 @@ def old_data_preprocessing(data_path: str, output_dir: str):
     logging.info(f"MinMaxScaler (包含 {len(scaler.feature_names_in_)} 個特徵) 已儲存至: {scaler_path}")
     logging.info(f"LabelEncoder (包含 {len(le.classes_)} 個類別) 已儲存至: {le_path}")
 
-    # 7. 轉換 (Transform) 資料以供回傳
+    # 9. 轉換 (Transform) 資料以供回傳
     X_train_scaled = scaler.transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
     y_train_encoded = le.transform(y_train)
     y_test_encoded = le.transform(y_test)
 
-    # 獲取模型所需的輸入維度
     input_features = X_train_scaled.shape[1]
     num_classes = len(le.classes_)
     
-    # 將資料轉換為 Tensors
     X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
     y_train_tensor = torch.tensor(y_train_encoded, dtype=torch.long)
     X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
     y_test_tensor = torch.tensor(y_test_encoded, dtype=torch.long)
 
-    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, input_features, num_classes, le
+    # (新) 返回 7 個項目
+    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, \
+           input_features, num_classes, le, class_weights_tensor 
 
 def preprocess_new_data(data_path: str, artifacts_dir: str):
     """
@@ -330,6 +455,8 @@ def load_and_clean_data(data_path: str, artifacts_dir: str):
         logging.error("2018 資料中找不到 'label' 欄位。")
         return None, None
     df_2018['label'] = df_2018['label'].astype(str).str.upper()
+    df_2018['label'] = df_2018['label'].replace('FTP-BRUTEFORCE', 'FTP-PATATOR')
+    df_2018['label'] = df_2018['label'].replace('SSH-BRUTEFORCE', 'SSH-PATATOR')
 
     # 4. 過濾標籤和特徵
     df_2018_filtered = df_2018[df_2018['label'].isin(known_labels)]

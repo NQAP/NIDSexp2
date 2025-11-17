@@ -16,6 +16,10 @@ from preprocessing import standardize_columns, clean_features
 # 導入新的生成模組
 from generation_module import train_stacked_ctgan
 
+from features_whitelist import FEATURES_WHITELIST, DISCRETE_FEATURES, CONTINUOUS_FEATURES
+
+from utils import set_seed
+
 def setup_logging():
     """設定日誌紀錄器"""
     logging.basicConfig(
@@ -27,13 +31,15 @@ def setup_logging():
 def main():
     
     setup_logging()
+
+    set_seed(42)
     
     parser = argparse.ArgumentParser(description="A-NIDS: 訓練 Stacked-CTGAN 生成模組")
-    parser.add_argument('--data_2017', type=str, required=True, 
+    parser.add_argument('--data_2017', type=str, default='./rawdata/2017.csv', 
                         help="2017 (D_old) 資料集的 .csv 檔案路徑。")
     parser.add_argument('--output_dir', type=str, default="./result",
                         help="儲存 ctgan_*.pkl 模型的輸出目錄。")
-    parser.add_argument('--epochs', type=int, default=1000,
+    parser.add_argument('--epochs', type=int, default=500,
                         help="每個 CTGAN 模型的訓練 Epoch 數 (CTGAN 需要較多時間)。")
     args = parser.parse_args()
 
@@ -65,17 +71,7 @@ def main():
     logging.info("清理特徵 (NaN, Inf, 全 0 欄位)...")
     df_clean = clean_features(df_clean)
     
-    # 確保 'label' 欄位存在且為大寫
-    if 'label' not in df_clean.columns:
-        logging.error("資料中找不到 'label' 欄位。請檢查 column_map.py。")
-        return
-    df_clean['label'] = df_clean['label'].astype(str).str.upper()
-    logging.info("資料清理完成。")
-
-    # 4. 找出要訓練的特徵欄位
-    #    (與 preprocessing.py 中的 id_cols 列表保持一致)
-    id_cols = ['flow_id', 'src_ip', 'src_port', 'dst_ip', 'dst_port', 'timestamp', 'protocol']
-    feature_cols = [col for col in df_clean.columns if col not in id_cols and col != 'label']
+    feature_cols = DISCRETE_FEATURES + CONTINUOUS_FEATURES
     
     if len(feature_cols) == 0:
         logging.error("沒有找到任何特徵欄位。請檢查 column_map.py 是否正確。")

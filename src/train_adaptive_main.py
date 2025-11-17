@@ -20,6 +20,8 @@ from preprocessing import standardize_columns, clean_features
 # 導入新的適應性模組
 from adaptive_module import train_adaptive_model
 
+from utils import set_seed
+
 def setup_logging():
     """設定日誌紀錄器"""
     logging.basicConfig(
@@ -30,6 +32,7 @@ def setup_logging():
 
 def main():
     setup_logging()
+    set_seed(42)
     
     parser = argparse.ArgumentParser(description="A-NIDS: 訓練 Adaptive Module (K-Means)")
     parser.add_argument('--data_2017', type=str, required=True, 

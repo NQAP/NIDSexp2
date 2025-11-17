@@ -2,33 +2,34 @@
 #
 # A-NIDS 論文復現 - 主執行腳本
 # 
-# 執行流程：
-# Phase 1: (Mlp-2017) 訓練初始 FCN 模型 (model_2017)
-# Phase 2: (Data Drift) 評估 model_2017 在 2018 資料上的效能 (展示資料漂移)
-# Phase 3: (A-NIDS Response)
-#    3.1: Adaptive Module 偵測漂移
-#    3.2: Generation Module 生成 D_old_fake
-#    3.3: 載入 D_new_real (2018)
-#    3.4: 合併 (D_old_fake + D_new_real) 並重新訓練 (A-NIDS_model)
-#    3.5: 評估 A-NIDS_model 在 2017 (防遺忘) 和 2018 (適應性) 上的效能
+# (新) Phase 1 訓練 Mlp-2017 時，傳入 `use_focal_loss=True`。
+# (新) Phase 3 訓練 A-NIDS 時，不傳入 (使用預設 False)。
+# (新) `old_data_preprocessing` 解包 7 個項目。
 
 import argparse
 import logging
 import os
 import torch
 import joblib
-import pandas as pd
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # 導入 A-NIDS 模組
-from preprocessing import old_data_preprocessing, preprocess_new_data, load_and_clean_data
+from preprocessing import old_data_preprocessing, preprocess_new_data
 from detect_module import detect_module
 from train_and_eval import train_model, evaluate_model, plot_training_history
-from adaptive_module import check_for_drift
-from generation_module import generate_stacked_data
+
+# 導入 Phase 3 響應模組
 from retrain_anids import phase_3_retrain
 
+from utils import set_seed
 
 def main(args):
+    set_seed(42)
     """主要執行函式"""
     logging.info("A-NIDS 論文復現腳本 (完整流程) 啟動...")
     
@@ -50,8 +51,10 @@ def main(args):
         )
         if data_2017[0] is None: raise Exception("old_data_preprocessing 失敗")
         
+        # (*** 新 ***) 解包 (現在是 7 個回傳值)
+        # (*** 新 ***) 解包 class_weights (現在有 8 個回傳值)
         X_train_2017, y_train_2017, X_test_2017, y_test_2017, \
-        feature_count, class_count, le_2017 = data_2017
+        feature_count, class_count, le_2017, class_weights = data_2017
         
         logging.info(f"資料預處理完成。特徵數: {feature_count}, 類別數: {class_count}")
         
@@ -67,13 +70,17 @@ def main(args):
 
     # 訓練 Mlp-2017
     try:
+        # (*** 新 ***) 傳入 class_weights
         model_2017, history_2017 = train_model(
             model_2017,
             X_train_2017, y_train_2017,
             X_test_2017, y_test_2017, # 使用 2017 測試集作為驗證集
-            args.epochs,
-            args.batch_size,
-            args.learning_rate
+            label_encoder=le_2017,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            class_weights=class_weights # <-- 在此傳入權重
+            # (已移除 gamma 和 use_focal_loss)
         )
     except Exception as e:
         logging.error(f"Mlp-2017 模型訓練失敗: {e}", exc_info=True)
@@ -115,7 +122,7 @@ def main(args):
         
         X_test_2018, y_test_2018, le_2018 = data_2018
         
-        logging.info("使用 Mlp-2017 模型評估 2018 年資料 (D_new)...")
+        logging.info(f"使用 Mlp-2017 模型評估 2018 年資料 (D_new)...")
         
         # (關鍵) 使用 2017 的模型去評估 2018 的資料
         evaluate_model(
@@ -140,16 +147,17 @@ def main(args):
         return
         
     try:
+        # 呼叫 retrain_anids 模組
         phase_3_retrain(
             artifacts_dir=args.output_dir,
             data_2018_path=args.data_2018,
             X_test_2017_tensor=X_test_2017,
             y_test_2017_tensor=y_test_2017,
-            X_test_2018_tensor=X_test_2018,
-            y_test_2018_tensor=y_test_2018,
+            X_test_2018_tensor=X_test_2018, # 傳入 D_new 的 100% 資料
+            y_test_2018_tensor=y_test_2018, 
             input_features=feature_count,
             num_classes=class_count,
-            args=args
+            args=args # 傳入完整的 args
         )
         logging.info("--- PHASE 3 完成 ---")
     except Exception as e:
@@ -160,11 +168,7 @@ def main(args):
 
 if __name__ == '__main__':
     # 1. 設定 Logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - [%(levelname)s] - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+    
 
     # 2. 設定 argparse
     parser = argparse.ArgumentParser(description="A-NIDS 論文 - 完整復現腳本")
@@ -188,17 +192,17 @@ if __name__ == '__main__':
     # --- FCN 訓練參數 ---
     parser.add_argument('--epochs', 
                         type=int, 
-                        default=20, 
+                        default=30, 
                         help="[可選] FCN 訓練的 Epoch 數量")
     
     parser.add_argument('--batch_size', 
                         type=int, 
-                        default=256, # 增加 batch size 加快訓練
+                        default=256, 
                         help="[可選] FCN 訓練的 Batch Size")
 
     parser.add_argument('--learning_rate', 
                         type=float, 
-                        default=0.001, 
+                        default=0.00005, 
                         help="[可選] FCN 優化器的學習率")
 
     # --- A-NIDS Phase 3 參數 ---
@@ -206,11 +210,6 @@ if __name__ == '__main__':
                         action='store_true', 
                         help="[可選] 如果設定此項，將跳過 Phase 3 (A-NIDS 重新訓練)")
                         
-    parser.add_argument('--gen_samples_per_label', 
-                        type=int, 
-                        default=1000, 
-                        help="[可選] 在 Phase 3 中，為每個舊標籤生成的樣本數")
-
     # 3. 解析參數並執行 main
     args = parser.parse_args()
     main(args)
