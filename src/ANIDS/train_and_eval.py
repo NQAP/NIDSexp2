@@ -245,29 +245,19 @@ def evaluate_model(model: nn.Module,
         logging.error("LabelEncoder 格式錯誤。")
         class_names = [str(i) for i in range(len(np.unique(all_labels)))]
 
-    # --- 關鍵修正區 ---
-    num_classes = len(class_names)
-    # 創建所有已知的類別索引 (e.g., [0, 1, 2, 3, 4, 5])
-    all_known_labels = np.arange(num_classes) 
-    # --- 關鍵修正區 END ---
-
     # --- 1. 計算準確率 ---
     accuracy = 100 * accuracy_score(all_labels, all_preds)
     logging.info(f"整體準確率 (Accuracy) on {dataset_name}: {accuracy:.2f}%")
 
     # --- 2. 儲存分類報告 (Classification Report) 為 .csv ---
     logging.info("正在生成分類報告...")
-    
-    # 💥 修正點 1：加入 labels 參數，並確保 zero_division=0 
     report_dict = classification_report(
         all_labels, 
         all_preds, 
-        labels=all_known_labels,    # 👈 強制報告使用所有 6 個類別索引
         target_names=class_names, 
         output_dict=True,
         zero_division=0
     )
-    
     report_df = pd.DataFrame(report_dict).transpose()
     print("分類報告：")
     print(report_df)
@@ -277,20 +267,13 @@ def evaluate_model(model: nn.Module,
 
     # --- 3. 繪製並儲存混淆矩陣 (Confusion Matrix) 為 .png ---
     logging.info("正在生成混淆矩陣圖...")
+    cm = confusion_matrix(all_labels, all_preds)
     
-    # 💥 修正點 2：加入 labels 參數
-    cm = confusion_matrix(
-        all_labels, 
-        all_preds,
-        labels=all_known_labels      # 👈 強制混淆矩陣使用所有 6 個類別索引
-    )
-    
-    # 繪圖參數保持不變
+    num_classes = len(class_names)
     fig_width = max(10, num_classes * 0.8)
     fig_height = max(8, num_classes * 0.6)
         
     plt.figure(figsize=(fig_width, fig_height))
-    # xticklabels/yticklabels 使用完整的 6 個 class_names
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
                 xticklabels=class_names, yticklabels=class_names)
     plt.title(f'Confusion Matrix - {dataset_name}', fontsize=16)

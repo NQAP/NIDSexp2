@@ -1,3 +1,4 @@
 *.csv
 result
+FCA_result
 __pycache__

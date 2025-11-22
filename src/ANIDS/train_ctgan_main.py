@@ -16,6 +16,8 @@ from preprocessing import standardize_columns, clean_features
 # 導入新的生成模組
 from generation_module import train_stacked_ctgan
 
+from features_whitelist import FEATURES_WHITELIST, DISCRETE_FEATURES, CONTINUOUS_FEATURES
+
 from utils import set_seed
 
 def setup_logging():
@@ -33,9 +35,9 @@ def main():
     set_seed(42)
     
     parser = argparse.ArgumentParser(description="A-NIDS: 訓練 Stacked-CTGAN 生成模組")
-    parser.add_argument('--data_2017', type=str, default='./FCA_DATASET/Train/Train_multiple.csv', 
+    parser.add_argument('--data_2017', type=str, default='./rawdata/2017.csv', 
                         help="2017 (D_old) 資料集的 .csv 檔案路徑。")
-    parser.add_argument('--output_dir', type=str, default="./FCA_result",
+    parser.add_argument('--output_dir', type=str, default="./result",
                         help="儲存 ctgan_*.pkl 模型的輸出目錄。")
     parser.add_argument('--epochs', type=int, default=500,
                         help="每個 CTGAN 模型的訓練 Epoch 數 (CTGAN 需要較多時間)。")
@@ -69,14 +71,14 @@ def main():
     logging.info("清理特徵 (NaN, Inf, 全 0 欄位)...")
     df_clean = clean_features(df_clean)
     
-    feature_cols = [col for col in df_clean.columns if col != 'label']
+    feature_cols = DISCRETE_FEATURES + CONTINUOUS_FEATURES
     
-    # if len(feature_cols) == 0:
-    #     logging.error("沒有找到任何特徵欄位。請檢查 column_map.py 是否正確。")
-    #     return
+    if len(feature_cols) == 0:
+        logging.error("沒有找到任何特徵欄位。請檢查 column_map.py 是否正確。")
+        return
         
-    # logging.info(f"將在 {len(feature_cols)} 個特徵上訓練 CTGAN。")
-    # logging.debug(f"特徵列表: {feature_cols[:5]}...") # 僅顯示前 5 個
+    logging.info(f"將在 {len(feature_cols)} 個特徵上訓練 CTGAN。")
+    logging.debug(f"特徵列表: {feature_cols[:5]}...") # 僅顯示前 5 個
 
     # 5. 執行 Stacked-CTGAN 訓練
     #    (這一步會花費很長時間)

@@ -37,7 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description="A-NIDS: 訓練 Adaptive Module (K-Means)")
     parser.add_argument('--data_2017', type=str, required=True, 
                         help="2017 (D_old) 資料集的 .csv 檔案路徑。")
-    parser.add_argument('--artifacts_dir', type=str, default="./FCA_result",
+    parser.add_argument('--artifacts_dir', type=str, default="./result",
                         help="讀取 scaler 並儲存 K-Means 模型的目錄。")
     
     # 論文中的 K 和 α [cite: 324]

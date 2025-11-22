@@ -2,7 +2,7 @@
 #
 # A-NIDS 論文復現 - 主執行腳本
 # 
-# (新) Phase 1 訓練 FCA_MLP 時，傳入 `use_focal_loss=True`。
+# (新) Phase 1 訓練 Mlp-2017 時，傳入 `use_focal_loss=True`。
 # (新) Phase 3 訓練 A-NIDS 時，不傳入 (使用預設 False)。
 # (新) `old_data_preprocessing` 解包 7 個項目。
 
@@ -38,10 +38,10 @@ def main(args):
     logging.info(f"所有產出 (artifacts) 將儲存至: {args.output_dir}")
 
     # ==================================================================
-    # PHASE 1: 訓練初始模型 (FCA_MLP)
+    # PHASE 1: 訓練初始模型 (Mlp-2017)
     # ==================================================================
     logging.info("="*50)
-    logging.info("PHASE 1: 訓練初始偵測模型 (FCA_MLP)")
+    logging.info("PHASE 1: 訓練初始偵測模型 (Mlp-2017)")
     logging.info("="*50)
     
     try:
@@ -63,53 +63,48 @@ def main(args):
         logging.error(f"Phase 1 資料預處理失敗: {e}", exc_info=True)
         return
 
-    # # 建立偵測模型 (FCA_MLP)
-    # model_2017 = detect_module(
-    #     input_features=feature_count,
-    #     num_classes=class_count
-    # )
+    # 建立偵測模型 (Mlp-2017)
+    model_2017 = detect_module(
+        input_features=feature_count,
+        num_classes=class_count
+    )
 
-    # # 訓練 FCA_MLP
-    # try:
-    #     # (*** 新 ***) 傳入 class_weights
-    #     model_2017, history_2017 = train_model(
-    #         model_2017,
-    #         X_train_2017, y_train_2017,
-    #         X_test_2017, y_test_2017, # 使用 2017 測試集作為驗證集
-    #         label_encoder=le_2017,
-    #         epochs=args.epochs,
-    #         batch_size=args.batch_size,
-    #         learning_rate=args.learning_rate,
-    #         class_weights=class_weights # <-- 在此傳入權重
-    #         # (已移除 gamma 和 use_focal_loss)
-    #     )
-    # except Exception as e:
-    #     logging.error(f"FCA_MLP 模型訓練失敗: {e}", exc_info=True)
-    #     return
+    # 訓練 Mlp-2017
+    try:
+        # (*** 新 ***) 傳入 class_weights
+        model_2017, history_2017 = train_model(
+            model_2017,
+            X_train_2017, y_train_2017,
+            X_test_2017, y_test_2017, # 使用 2017 測試集作為驗證集
+            label_encoder=le_2017,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            class_weights=class_weights # <-- 在此傳入權重
+            # (已移除 gamma 和 use_focal_loss)
+        )
+    except Exception as e:
+        logging.error(f"Mlp-2017 模型訓練失敗: {e}", exc_info=True)
+        return
 
-    # # 儲存 FCA_MLP
-    model_path = os.path.join(args.output_dir, "FCA_MLP_old.pth")
-    # torch.save(model_2017.state_dict(), model_path)
-    # logging.info(f"初始模型 (FCA_MLP) 已儲存至: {model_path}")
+    # 儲存 Mlp-2017
+    model_path = os.path.join(args.output_dir, "model_2017.pth")
+    torch.save(model_2017.state_dict(), model_path)
+    logging.info(f"初始模型 (Mlp-2017) 已儲存至: {model_path}")
         
-    # # 評估 FCA_MLP 在 D_old 上的效能
-    # logging.info("--- 評估 FCA_MLP 在 2017 測試集 (D_old) 上的效能 ---")
-    # evaluate_model(model_2017, X_test_2017, y_test_2017, le_2017, 
-    #                args.output_dir, dataset_name="FCA-MLP_on_old")
+    # 評估 Mlp-2017 在 D_old 上的效能
+    logging.info("--- 評估 Mlp-2017 在 2017 測試集 (D_old) 上的效能 ---")
+    evaluate_model(model_2017, X_test_2017, y_test_2017, le_2017, 
+                   args.output_dir, dataset_name="Mlp-2017_on_2017_D_old")
     
-    # # 繪製 FCA_MLP 訓練歷史
-    # # plot_training_history(history_2017, args.output_dir, plot_filename="mlp_2017_training_history.png")
+    # 繪製 Mlp-2017 訓練歷史
+    plot_training_history(history_2017, args.output_dir, plot_filename="mlp_2017_training_history.png")
     
-    # logging.info("--- PHASE 1 完成 ---")
+    logging.info("--- PHASE 1 完成 ---")
 
     # ==================================================================
     # PHASE 2: 評估資料漂移 (Data Drift)
     # ==================================================================
-    model = detect_module(
-        input_features=feature_count,
-        num_classes=class_count
-    )
-    model.load_state_dict(torch.load(model_path))
     if not args.data_2018:
         logging.info("未提供 --data_2018 參數。腳本在 Phase 1 後結束。")
         return
@@ -117,7 +112,6 @@ def main(args):
     logging.info("="*50)
     logging.info("PHASE 2: 評估資料漂移 (Data Drift)")
     logging.info("="*50)
-
     
     try:
         # 載入並處理 2018 資料 (僅用於評估)
@@ -125,21 +119,20 @@ def main(args):
             args.data_2018,
             args.output_dir
         )
-
         if data_2018[0] is None: raise Exception("preprocess_new_data 失敗")
         
-        X_train_2018, y_train_2018, X_test_2018, y_test_2018, le_2018 = data_2018
+        X_test_2018, y_test_2018, le_2018 = data_2018
         
-        logging.info("使用 FCA_MLP 模型評估 2018 年資料 (D_new)...")
+        logging.info(f"使用 Mlp-2017 模型評估 2018 年資料 (D_new)...")
         
         # (關鍵) 使用 2017 的模型去評估 2018 的資料
         evaluate_model(
-            model, # <-- 2017 的模型
+            model_2017, # <-- 2017 的模型
             X_test_2018, # <-- 2018 的資料
             y_test_2018, # <-- 2018 的標籤
             le_2018, 
             args.output_dir,
-            dataset_name="Train_MLP_on_xss_FCA" # 預期效能會很差
+            dataset_name="Mlp-2017_on_2018_D_new" # 預期效能會很差
         )
         logging.info("--- PHASE 2 完成 (已展示資料漂移) ---")
 
@@ -161,8 +154,6 @@ def main(args):
             data_2018_path=args.data_2018,
             X_test_2017_tensor=X_test_2017,
             y_test_2017_tensor=y_test_2017,
-            X_train_2018_tensor=X_train_2018,
-            y_train_2018_tensor=y_train_2018,
             X_test_2018_tensor=X_test_2018, # 傳入 D_new 的 100% 資料
             y_test_2018_tensor=y_test_2018, 
             input_features=feature_count,
@@ -196,13 +187,13 @@ if __name__ == '__main__':
     
     parser.add_argument('--output_dir', 
                         type=str, 
-                        default="./FCA_result", 
+                        default="./result", 
                         help="[可選] 儲存所有 artifacts (scalers, models, reports) 的目錄")
     
     # --- FCN 訓練參數 ---
     parser.add_argument('--epochs', 
                         type=int, 
-                        default=50, 
+                        default=30, 
                         help="[可選] FCN 訓練的 Epoch 數量")
     
     parser.add_argument('--batch_size', 

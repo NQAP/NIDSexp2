@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 
 # --- 導入欄位名稱對應表 ---
 from column_map import COLUMN_MAP
-# from features_whitelist import FEATURES_WHITELIST
+from features_whitelist import FEATURES_WHITELIST
 from generation_module import generate_stacked_data
 
 def standardize_columns(df):
@@ -33,7 +33,23 @@ def standardize_columns(df):
     # (例如, 現在我們有兩個 'fwd header length', 只保留第一個)
     # 這裡使用 .loc 來避免 SettingWithCopyWarning
     df = df.loc[:, ~df.columns.duplicated(keep='first')]
-    df.columns = [col.replace(' ', '_') for col in df.columns]
+    
+    # 4. 重新命名：使用 COLUMN_MAP
+    # 找出 df 中存在於對應表 key 的欄位
+    renameable_cols = [col for col in df.columns if col in COLUMN_MAP]
+    if renameable_cols:
+        logging.debug(f"將使用對應表重命名 {len(renameable_cols)} 個欄位...")
+        df = df.rename(columns=COLUMN_MAP)
+    else:
+        logging.warning("欄位名稱對應表中沒有任何欄位與此 DataFrame 的欄位匹配。")
+
+    # 5. 檢查是否有未被對應的欄位 (幫助除錯)
+    unmapped_cols = [
+        col for col in df.columns 
+        if col not in COLUMN_MAP.values() and col not in ['label'] # 排除已是目標或 label
+    ]
+    if unmapped_cols and 'flow_id' in df.columns: # 只在看起來像特徵檔時警告
+        logging.debug(f"注意：有 {len(unmapped_cols)} 個欄位未在對應表中找到 (可能是不需要的欄位): {unmapped_cols[:5]}...") # 只顯示前5個
 
     return df
 
@@ -68,14 +84,105 @@ def clean_features(df):
         logging.info(f"移除 {len(all_zero_columns)} 個全為 0 的特徵: {all_zero_columns}")
         df = df.drop(columns=all_zero_columns)
 
-    normal_mapping = {
-        '0': 'normal',
-        0: 'normal'
-    }
+    feature_cols = [col for col in FEATURES_WHITELIST if col in df.columns]
+    
+    missing_in_csv = set(FEATURES_WHITELIST) - set(df.columns)
+    if missing_in_csv:
+        logging.warning(f"您的 CSV 檔案中缺少 TABLE V 的 {len(missing_in_csv)} 個特徵: {list(missing_in_csv)[:5]}...")
+        
+    logging.info(f"成功匹配 {len(feature_cols)} / 58 個來自 TABLE V 的特徵。")
 
-    df['label'] = df['label'].replace(normal_mapping)
+    if len(feature_cols) == 0:
+        logging.error("沒有找到任何 TABLE V 特徵欄位。請檢查 column_map.py 是否正確。")
+        return None, None, None, None, None, None, None
 
+    df = df[feature_cols]
+        
     return df
+
+# (新) 定義重採樣的常數
+# 必須與 train_stacked_ctgan.py 中的 MAX_SAMPLES_PER_MODEL 一致
+TARGET_SAMPLES_PER_CLASS = 15000 
+# (*** 新增：定義多數類別的名稱 ***)
+MAJORITY_CLASS_NAME = "BENIGN" # 假設 'BENIGN' 已被轉為大寫
+
+
+def resample_with_hybrid_ctgan(X_train_df: pd.DataFrame, 
+                             y_train_series: pd.Series,
+                             artifacts_dir: str, 
+                             label_encoder,
+                             num_samples_per_label: int = 15000):
+    """
+    (*** 重構：混合採樣 (Hybrid Sampling) ***)
+    使用 Stacked-CTGAN 模型來平衡訓練資料集。
+    
+    - 對 MAJORITY_CLASS_NAME (例如 'BENIGN') 進行「欠採樣」(Undersample) 真實資料。
+    - 對所有「其他類別」(攻擊)，載入其 CTGAN 模型並進行「過採樣」(Oversample) 生成合成資料。
+    - 對生成的資料進行反向 Log 轉換 (expm1)。
+    - 返回一個平衡的、(真實+合成) 混合的資料集。
+    """
+    logging.info(f"--- 開始「混合採樣」 (目標: {num_samples_per_label} 筆 / 每個類別) ---")
+    
+    # 將 X 和 y 暫時合併，以便過濾
+    df_train = X_train_df.copy()
+    df_train['label'] = y_train_series
+    
+    resampled_dfs = [] # 用於收集所有平衡後的資料框
+    unique_labels = y_train_series.unique()
+
+    for label in unique_labels:
+        if label == MAJORITY_CLASS_NAME:
+            # --- 1. 多數類別：欠採樣 (Undersample) 真實資料 ---
+            logging.info(f"  處理多數類別 '{label}': 進行「欠採樣」...")
+            label_data = df_train[df_train['label'] == label]
+            
+            # 確保即使原始資料少於目標，也能正常運作
+            sample_size = min(len(label_data), num_samples_per_label)
+            resampled_data = label_data.sample(
+                n=sample_size, 
+                random_state=42
+            )
+            resampled_dfs.append(resampled_data)
+        
+        else:
+            # --- 2. 少數類別 (攻擊)：過採樣 (Oversample) 合成資料 ---
+            model_path = os.path.join(artifacts_dir, f"ctgan_{label}.pkl")
+            
+            if not os.path.exists(model_path):
+                logging.warning(f"  找不到 '{label}' 的 CTGAN 模型。將使用「原始資料」進行欠採樣...")
+                # 備案：如果 GAN 不存在，也對其進行欠採樣（或使用全部）
+                label_data = df_train[df_train['label'] == label]
+                sample_size = min(len(label_data), num_samples_per_label)
+                resampled_data = label_data.sample(n=sample_size, random_state=42)
+                resampled_dfs.append(resampled_data)
+                continue
+                
+            logging.info(f"  處理少數類別 '{label}': 進行「過採樣」(生成資料)...")
+            try:
+                label_data = df_train[df_train['label'] == label]
+                sample_size = max(0, num_samples_per_label - len(df_train[df_train['label'] == label])) 
+                synthetic_data = generate_stacked_data(artifacts_dir=artifacts_dir, label=label, num_samples_per_label=sample_size)
+                
+                synthetic_data['label'] = label 
+                resampled_dfs.append(synthetic_data)
+                resampled_dfs.append(label_data)
+                
+            except Exception as e:
+                logging.error(f"  生成 '{label}' 資料失敗: {e}. 跳過此類別。")
+
+    if not resampled_dfs:
+        logging.error("未生成或採樣任何資料。中止。")
+        return pd.DataFrame(), pd.Series()
+
+    # 將所有處理過的資料框合併
+    df_resampled = pd.concat(resampled_dfs, ignore_index=True)
+    
+    # 徹底隨機打亂最終的資料集
+    df_resampled = df_resampled.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    logging.info(f"「混合採樣」完成。總共 {len(df_resampled)} 筆資料。")
+    
+    return df_resampled
 
 def old_data_preprocessing(data_path: str, output_dir: str):
     """
@@ -250,32 +357,7 @@ def preprocess_new_data(data_path: str, artifacts_dir: str):
     df_2018 = standardize_columns(df_2018)
 
     # 4. 清理 2018 特徵
-    numeric_cols = df_2018.select_dtypes(include=[np.number]).columns
-    
-    if df_2018[numeric_cols].isnull().values.any() or \
-       np.isinf(df_2018[numeric_cols].values).any():
-        
-        logging.debug("偵測到 NaN 或 Infinity 值。")
-        # 將 Inf 替換為 NaN
-        df_2018[numeric_cols] = df_2018[numeric_cols].replace([np.inf, -np.inf], np.nan)
-        
-        # 用 0 填充 NaN (您可以根據需要更改為 .mean() 或 .median())
-        # 用 0 填充是 CICFlowMeter 資料集的常見做法
-        original_nan_count = df_2018[numeric_cols].isnull().sum().sum()
-        if original_nan_count > 0:
-            logging.debug(f"正在用 0 填充 {original_nan_count} 個 NaN 值...")
-            df_2018[numeric_cols] = df_2018[numeric_cols].fillna(0)
-    
-    # 移除屬性值均為零的特徵
-    # 再次僅檢查數字欄位
-    
-
-    normal_mapping = {
-        '0': 'normal',
-        0: 'normal'
-    }
-
-    df_2018['label'] = df_2018['label'].replace(normal_mapping)
+    df_2018 = clean_features(df_2018)
 
     # 5. 將標籤轉為大寫以進行比對
     if 'label' not in df_2018.columns:
@@ -321,27 +403,17 @@ def preprocess_new_data(data_path: str, artifacts_dir: str):
         logging.error("載入的 Scaler 物件沒有 'feature_names_in_' 屬性。請確保 Scaler 是用 Pandas DataFrame 擬合的。")
         return None, None, None
 
-    
-
     # 8. 轉換 (Transform) 資料
     logging.info("正在使用 2017 年的 Scaler 和 Encoder 轉換 2018 年資料...")
     X_2018_scaled = scaler.transform(features_2018)
     y_2018_encoded = le.transform(labels_2018)
-
-    # 4. 分割資料 (7:3)
-    logging.info("將 2017 資料分割為 70% 訓練集和 30% 測試集...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_2018_scaled, y_2018_encoded, test_size=0.3, random_state=42, stratify=y_2018_encoded
-    )
     
     # 9. 將資料轉換為 Tensors
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.long)
-    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-    y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+    X_test_tensor = torch.tensor(X_2018_scaled, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_2018_encoded, dtype=torch.long)
 
     logging.info("2018 (D_new) 資料處理完成。")
-    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, le
+    return X_test_tensor, y_test_tensor, le
 
 # (新) 用於 A-NIDS 重新訓練的輔助函式
 def load_and_clean_data(data_path: str, artifacts_dir: str):
@@ -377,32 +449,7 @@ def load_and_clean_data(data_path: str, artifacts_dir: str):
         
     # 3. 標準化欄位 & 清理特徵
     df_2018 = standardize_columns(df_2018)
-    numeric_cols = df_2018.select_dtypes(include=[np.number]).columns
-    
-    if df_2018[numeric_cols].isnull().values.any() or \
-       np.isinf(df_2018[numeric_cols].values).any():
-        
-        logging.debug("偵測到 NaN 或 Infinity 值。")
-        # 將 Inf 替換為 NaN
-        df_2018[numeric_cols] = df_2018[numeric_cols].replace([np.inf, -np.inf], np.nan)
-        
-        # 用 0 填充 NaN (您可以根據需要更改為 .mean() 或 .median())
-        # 用 0 填充是 CICFlowMeter 資料集的常見做法
-        original_nan_count = df_2018[numeric_cols].isnull().sum().sum()
-        if original_nan_count > 0:
-            logging.debug(f"正在用 0 填充 {original_nan_count} 個 NaN 值...")
-            df_2018[numeric_cols] = df_2018[numeric_cols].fillna(0)
-    
-    # 移除屬性值均為零的特徵
-    # 再次僅檢查數字欄位
-    
-
-    normal_mapping = {
-        '0': 'normal',
-        0: 'normal'
-    }
-
-    df_2018['label'] = df_2018['label'].replace(normal_mapping)
+    df_2018 = clean_features(df_2018)
     
     if 'label' not in df_2018.columns:
         logging.error("2018 資料中找不到 'label' 欄位。")
